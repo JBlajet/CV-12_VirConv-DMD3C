@@ -45,48 +45,112 @@ def load_calibration(calib_path: Path):
     with open(calib_path, "r") as f:
         lines = f.readlines()
 
-    P2_line = [l for l in lines if l.startswith("P2:")][0]
-    P2_vals = np.array(P2_line.strip().split()[1:], dtype=np.float32)
-    P2 = P2_vals.reshape(3, 4)
-    K = P2[:3, :3].copy()
+    # Try P2 first (common KITTI format), fall back to P_rect_02
+    p_line = None
+    for prefix in ("P2:", "P_rect_02:"):
+        matches = [l for l in lines if l.startswith(prefix)]
+        if matches:
+            p_line = matches[0]
+            break
 
-    # Adjust for center crop (image is cropped from 1242→1216 width and 390→352 height)
-    K[0, 2] -= 13   # x-center shift
-    K[1, 2] -= 11.5 # y-center shift
+    if p_line is None:
+        raise ValueError(f"No projection matrix line found in {calib_path}")
 
-    return K
+    P_vals = np.array(p_line.strip().split()[1:], dtype=np.float32)
+    # Handle both 12-value (3x4) and 16-value (4x4) formats
+    if len(P_vals) == 16:
+        P_mat = P_vals.reshape(4, 4)[:3, :3]
+    else:
+        P_mat = P_vals.reshape(3, 4)[:3, :3]
 
-
-# ---------------------------------------------------------------------------
-# Data loading helpers (shared by both models)
-# ---------------------------------------------------------------------------
-
-def load_image(image_path: Path):
-    """Load RGB image and crop to [352, 1216]."""
-    img = np.array(Image.open(image_path).convert("RGB"), dtype=np.float32)
-    # Center crop: height from 390→352 (crop ~19 top + ~19 bottom), width from 1242→1216 (crop 13 each side)
-    img = img[19:371, 13:1229]
-    return img
+    return P_mat.copy()
 
 
-def load_velodyne(velo_path: Path):
-    """Load .bin velodyne file and return Nx4 array."""
-    data = np.fromfile(str(velo_path), dtype=np.float32)
-    return data.reshape(-1, 4)[:, :3]  # discard reflectance
+def load_velo2cam_transform(calib_path: Path):
+    """Load R_velo2cam and T_cam from calibration file.
+
+    Handles two KITTI calib formats:
+      1) Separate 'R:' + 'T:' lines (demo.py style files)
+      2) Single 'Tr_velo_to_cam:' line with 12 values = combined [R | T] matrix
+    
+    Returns RT matrix (3x4) = [R | T] for transforming lidar points.
+    """
+    with open(calib_path, "r") as f:
+        lines = f.readlines()
+
+    R_vals = None
+    T_vals = None
+
+    # Try Tr_velo_to_cam format first (actual KITTI calibration files)
+    for line in lines:
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key == "Tr_velo_to_cam":
+            vals = np.array([float(x) for x in value.split()], dtype=np.float32)
+            # 12 values = combined [R | T] matrix (3x4)
+            RT_matrix = vals.reshape(3, 4)
+            R_vals = RT_matrix[:, :3]   # Rotation part (3x3)
+            T_vals = RT_matrix[:, 3:4]  # Translation part (3x1 column vector)
+            break
+
+    # Fallback to separate R/T lines if Tr_velo_to_cam not found
+    if R_vals is None or T_vals is None:
+        for line in lines:
+            key, _, value = line.partition(":")
+            key = key.strip()
+            if key == "R":
+                R_vals = np.array([float(x) for x in value.split()], dtype=np.float32).reshape(3, 3)
+            elif key == "T":
+                T_vals = np.array([float(x) for x in value.split()], dtype=np.float32).reshape(3, 1)
+
+    if R_vals is None or T_vals is None:
+        raise ValueError(f"Could not find transform lines in {calib_path}. Expected 'Tr_velo_to_cam:' (12 values) or separate 'R:' + 'T:' lines.")
+
+    RT = np.hstack([R_vals, T_vals])  # 3x4 matrix [R | T]
+    return RT
 
 
-def generate_sparse_depth(lidar_points: np.ndarray, K: np.ndarray):
-    """Project LiDAR points to image plane and create sparse depth map (352x1216)."""
+def project_lidar_to_depth(lidar_points: np.ndarray, K: np.ndarray, RT: np.ndarray):
+    """Project LiDAR points to depth map using camera intrinsics.
+
+    First transforms lidar from velodyne frame to camera rectified coordinate frame
+    using R_velo2cam and T_cam from calibration file, then projects with K.
+    Returns a sparse depth map (HxW) with NaN where no point exists.
+    """
     H, W = 352, 1216
-    sparse_map = np.zeros((H, W), dtype=np.float32)
+    depth_map = np.full((H, W), np.nan, dtype=np.float32)
 
     # Transform lidar from velodyne frame to camera rectified frame
-    # R_rect (from calibration file line "R0_rect") and Tr_velo_to_cam are needed
-    return sparse_map  # simplified — full projection done below
+    # Append homogeneous coordinate (1) and apply RT transform
+    N = len(lidar_points)
+    if N == 0:
+        return depth_map
+
+    homo_points = np.hstack([lidar_points, np.ones((N, 1))])  # Nx4
+    cam_points = (RT @ homo_points.T).T  # Nx3 in camera coordinates
+
+    x_img = cam_points[:, 0] / (cam_points[:, 2] + 1e-8) * K[0, 0] + K[0, 2]
+    y_img = cam_points[:, 1] / (cam_points[:, 2] + 1e-8) * K[1, 1] + K[1, 2]
+
+    ix = np.floor(x_img).astype(int)
+    iy = np.floor(y_img).astype(int)
+
+    valid = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H) & (cam_points[:, 2] > 0.5)
+
+    ix, iy = ix[valid], iy[valid]
+    depths = cam_points[valid, 2]
+
+    # Keep the closest point at each pixel using np.maximum for efficiency
+    for i in range(len(ix)):
+        d = depths[i]
+        if depth_map[iy[i], ix[i]] == np.nan or d < depth_map[iy[i], ix[i]]:
+            depth_map[iy[i], ix[i]] = d
+
+    return depth_map
 
 
-def project_lidar_to_depth(lidar_points: np.ndarray, K: np.ndarray):
-    """Project LiDAR points to depth map using camera intrinsics.
+def project_lidar_to_depth_simple(lidar_points: np.ndarray, K: np.ndarray):
+    """Simplified projection without velodyne→camera transform.
 
     Assumes lidar is already in the camera rectified coordinate frame (common for KITTI training data).
     Returns a 352x1216 sparse depth map with NaN where no point exists.
@@ -114,6 +178,42 @@ def project_lidar_to_depth(lidar_points: np.ndarray, K: np.ndarray):
     return depth_map
 
 
+# Legacy function kept for backward compatibility — uses simple projection without RT transform
+def generate_sparse_depth(lidar_points: np.ndarray, K: np.ndarray):
+    """Project LiDAR points to image plane and create sparse depth map (352x1216)."""
+    return project_lidar_to_depth_simple(lidar_points, K)
+
+
+# ---------------------------------------------------------------------------
+# Data loading helpers (shared by both models)
+# ---------------------------------------------------------------------------
+
+def load_image(image_path: Path):
+    """Load RGB image and crop to [352, 1216].
+
+    Computes dynamic crop offsets from actual image size rather than hardcoding.
+    Matches demo.py pattern: tp = img.shape[0] - 352, lp = (img.shape[1] - 1216) // 2
+    """
+    img = np.array(Image.open(image_path).convert("RGB"), dtype=np.float32)
+    
+    # Dynamic crop offsets computed from actual image dimensions
+    H_orig, W_orig = img.shape[:2]
+    target_H, target_W = 352, 1216
+    
+    tp = (H_orig - target_H) // 2   # top padding
+    lp = (W_orig - target_W) // 2   # left padding
+    
+    img = img[tp:tp + target_H, lp:lp + target_W]
+    
+    return img
+
+
+def load_velodyne(velo_path: Path):
+    """Load .bin velodyne file and return Nx4 array."""
+    data = np.fromfile(str(velo_path), dtype=np.float32)
+    return data.reshape(-1, 4)[:, :3]  # discard reflectance
+
+
 # ---------------------------------------------------------------------------
 # Depth visualization (shared, consistent for both models)
 # ---------------------------------------------------------------------------
@@ -121,50 +221,18 @@ def project_lidar_to_depth(lidar_points: np.ndarray, K: np.ndarray):
 DEPTH_MIN = 0.5   # minimum valid distance in meters
 DEPTH_MAX = 70.0  # maximum clipping range — matches DMD3C default
 
-def visualize_depth(depth: np.ndarray) -> np.ndarray:
-    """Convert depth map to color image using OpenCV COLORMAP_JET, clipped [DEPTH_MIN, DEPTH_MAX]."""
-    vis = np.zeros((depth.shape[0], depth.shape[1], 3), dtype=np.uint8)
-
-    # Mask valid depths within range
-    mask = (depth >= DEPTH_MIN) & (depth <= DEPTH_MAX)
-    clipped_depth = np.clip(depth, DEPTH_MIN, DEPTH_MAX)
-
-    # Normalize to [0, 255] for colormap
-    normed = np.zeros_like(clipped_depth)
-    valid_count = mask.sum()
-    if valid_count > 1:
-        d_min_local = clipped_depth[mask].min()
-        d_max_local = clipped_depth[mask].max()
-        if d_max_local - d_min_local > 0:
-            normed[mask] = (clipped_depth[mask] - d_min_local) / (d_max_local - d_min_local) * 255.0
-
-    # Apply colormap only to valid regions
-    vis_uint8 = np.uint8(normed)
-    for h in range(vis.shape[0]):
-        for w in range(vis.shape[1]):
-            if mask[h, w]:
-                vis[h, w] = cv2.applyColorMap(vis_uint8[h, w:h+1, w:w+1], cv2.COLORMAP_JET)[0, 0]
-
-    # Faster vectorized version:
-    normed_3ch = np.stack([normed] * 3, axis=-1)
-    vis_colored = np.zeros((H_vis := depth.shape[0], W_vis := depth.shape[1], 3), dtype=np.uint8)
-    
-    for h in range(depth.shape[0]):
-        row_mask = mask[h]
-        if row_mask.any():
-            vis_colored[h, row_mask] = cv2.applyColorMap(normed_3ch[h, row_mask].astype(np.uint8), cv2.COLORMAP_JET)
-
-    return vis_colored
-
-
 def visualize_depth_fast(depth: np.ndarray) -> np.ndarray:
-    """Faster vectorized depth visualization using OpenCV COLORMAP_JET."""
+    """Faster vectorized depth visualization using OpenCV COLORMAP_JET.
+
+    Invalid regions (outside [DEPTH_MIN, DEPTH_MAX] or NaN) are left BLACK (0,0,0).
+    Valid regions use normalized colormap with local min/max scaling for best contrast.
+    """
     H, W = depth.shape
     
     # Create a float32 version for colormap input (values 0-255 expected by applyColorMap)
     normed = np.zeros((H, W), dtype=np.float32)
     
-    mask = (depth >= DEPTH_MIN) & (depth <= DEPTH_MAX)
+    mask = (depth >= DEPTH_MIN) & (depth <= DEPTH_MAX) & ~np.isnan(depth)
     clipped_depth = np.clip(depth, DEPTH_MIN, DEPTH_MAX).copy()
     
     if mask.sum() > 1:
@@ -177,7 +245,7 @@ def visualize_depth_fast(depth: np.ndarray) -> np.ndarray:
     normed_uint8 = np.uint8(np.clip(normed, 0, 255))
     
     # Apply colormap row by row (vectorized per-row)
-    vis_colored = np.zeros((H, W, 3), dtype=np.uint8)
+    vis_colored = np.zeros((H, W, 3), dtype=np.uint8)  # Invalid regions stay BLACK
     for h in range(H):
         if mask[h].any():
             vis_colored[h] = cv2.applyColorMap(normed_uint8[h:h+1], cv2.COLORMAP_JET)[0]
@@ -216,8 +284,9 @@ def run_dmd3c(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
     
     K_tensor = torch.from_numpy(K.astype(np.float32)).unsqueeze(0).to(device)
 
+    # DISP parameter is required by BPNet.forward(I, DISP, S, K) but can be None
     with torch.no_grad():
-        pred_depth = model(img_tensor, sparse_tensor, K_tensor)  # returns depth map
+        pred_depth = model(img_tensor, None, sparse_tensor, K_tensor)  # returns depth map
     
     return pred_depth.squeeze().cpu().numpy()
 
@@ -331,13 +400,14 @@ def compare_single_frame(frame_id: str, save_dir: Path | None = None):
     # Load data
     print(f"  Loading frame {frame_id}...")
     
-    image = load_image(image_path)  # HxWxC, uint8
+    image = load_image(image_path)  # HxWxC, float32
     
     lidar_points = load_velodyne(velo_path)
     
     K = load_calibration(calib_path)
+    RT = load_velo2cam_transform(calib_path)
     
-    sparse_depth = project_lidar_to_depth(lidar_points, K)
+    sparse_depth = project_lidar_to_depth(lidar_points, K, RT)
 
     print(f"  LiDAR points: {len(lidar_points)}, Valid depth pixels: {(sparse_depth > DEPTH_MIN).sum()}")
 
