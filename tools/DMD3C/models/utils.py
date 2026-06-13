@@ -49,7 +49,11 @@ class BpDist(Function):
             Pc = torch.masked_select(xy, Valid[b:b + 1].view(1, 1, N)).reshape(1, 2, -1)
             BpOps.Dist(Pc, IPCnum[b:b + 1], args[b:b + 1], H, W)
             idx_valid = torch.masked_select(idx, Valid[b:b + 1].view(1, 1, N))
-            args[b:b + 1] = torch.index_select(idx_valid, 0, args[b:b + 1].reshape(-1)).reshape(1, num, N)
+            if Pc.shape[2] == 0:
+                # No valid points — skip index_select to avoid out-of-range error
+                args[b:b + 1] = torch.zeros((num, N), dtype=torch.long, device=xy.device)
+            else:
+                args[b:b + 1] = torch.index_select(idx_valid, 0, args[b:b + 1].reshape(-1)).reshape(1, num, N)
         return IPCnum, args
 
     @staticmethod

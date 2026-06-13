@@ -221,10 +221,10 @@ def load_velodyne(velo_path: Path):
 DEPTH_MIN = 0.5   # minimum valid distance in meters
 DEPTH_MAX = 70.0  # maximum clipping range — matches DMD3C default
 
-def visualize_depth_fast(depth: np.ndarray) -> np.ndarray:
+def visualize_depth_fast(depth: np.ndarray, min_valid: float = DEPTH_MIN) -> np.ndarray:
     """Faster vectorized depth visualization using OpenCV COLORMAP_JET.
 
-    Invalid regions (outside [DEPTH_MIN, DEPTH_MAX] or NaN) are left BLACK (0,0,0).
+    Invalid regions (outside [min_valid, DEPTH_MAX] or NaN) are left BLACK (0,0,0).
     Valid regions use normalized colormap with local min/max scaling for best contrast.
     """
     H, W = depth.shape
@@ -232,8 +232,8 @@ def visualize_depth_fast(depth: np.ndarray) -> np.ndarray:
     # Create a float32 version for colormap input (values 0-255 expected by applyColorMap)
     normed = np.zeros((H, W), dtype=np.float32)
     
-    mask = (depth >= DEPTH_MIN) & (depth <= DEPTH_MAX) & ~np.isnan(depth)
-    clipped_depth = np.clip(depth, DEPTH_MIN, DEPTH_MAX).copy()
+    mask = (depth >= min_valid) & (depth <= DEPTH_MAX) & ~np.isnan(depth)
+    clipped_depth = np.clip(depth, min_valid, DEPTH_MAX).copy()
     
     if mask.sum() > 1:
         d_min_local = clipped_depth[mask].min()
@@ -259,16 +259,16 @@ def visualize_depth_fast(depth: np.ndarray) -> np.ndarray:
 
 def run_dmd3c(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
     """Run DMD3C model and return predicted depth map."""
-    # Import paths for DMD3C submodule
+    # Import paths for DMD3C submodule (needed so BpOps.py stub is findable)
     dmd3c_dir = Path(__file__).parent / "DMD3C"
     sys.path.insert(0, str(dmd3c_dir))
 
     from models.BPNet import Net  # main model class
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # force CPU — uses local BpOps.py stub instead of CUDA extension
     
     # Load model weights
-    checkpoint = torch.load(str(DMD3C_MODEL_PATH), map_location=device)
+    checkpoint = torch.load(str(DMD3C_MODEL_PATH), map_location=device, weights_only=False)
     state_dict = checkpoint['net'] if isinstance(checkpoint, dict) and 'net' in checkpoint else checkpoint
     
     model = Net().to(device)
@@ -286,8 +286,10 @@ def run_dmd3c(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
 
     # DISP parameter is required by BPNet.forward(I, DISP, S, K) but can be None
     with torch.no_grad():
-        pred_depth = model(img_tensor, None, sparse_tensor, K_tensor)  # returns depth map
+        output_list = model(img_tensor, None, sparse_tensor, K_tensor)  # returns list of tensors
     
+    # The last element (pred0) is the full-resolution prediction
+    pred_depth = output_list[-1] if isinstance(output_list, list) else output_list
     return pred_depth.squeeze().cpu().numpy()
 
 
@@ -302,7 +304,7 @@ def run_penet(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
 
     from model import ENet  # main model class
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # force CPU — uses .cpu() fallbacks in model.py
     
     # Create args namespace matching PENet's argparse expectations
     class Args:
@@ -313,7 +315,7 @@ def run_penet(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
     
     args = Args()
 
-    checkpoint = torch.load(str(PENET_MODEL_PATH), map_location=device)
+    checkpoint = torch.load(str(PENET_MODEL_PATH), map_location=device, weights_only=False)
     
     # Handle different checkpoint formats (some have 'state_dict', others direct weights)
     if isinstance(checkpoint, dict):
@@ -415,14 +417,23 @@ def compare_single_frame(frame_id: str, save_dir: Path | None = None):
     print("  Running DMD3C...")
     dmd3c_depth = run_dmd3c(image, sparse_depth, K)
     
+    # Debug: check what models returned
+    if isinstance(dmd3c_depth, np.ndarray):
+        valid_count = ((dmd3c_depth >= DEPTH_MIN) & (dmd3c_depth <= DEPTH_MAX)).sum()
+        print(f"  DMD3C output shape={dmd3c_depth.shape}, min={dmd3c_depth.min():.2f}, max={dmd3c_depth.max():.2f}, valid pixels={valid_count}")
+
     # Run PENet  
     print("  Running PENet...")
     penet_depth = run_penet(image, sparse_depth, K)
+    
+    if isinstance(penet_depth, np.ndarray):
+        valid_count_p = ((penet_depth >= DEPTH_MIN) & (penet_depth <= DEPTH_MAX)).sum()
+        print(f"  PENET output shape={penet_depth.shape}, min={penet_depth.min():.2f}, max={penet_depth.max():.2f}, valid pixels={valid_count_p}")
 
     # Visualize all depth maps consistently (OpenCV COLORMAP_JET, [0.5, 70]m clip)
     vis_sparse = visualize_depth_fast(sparse_depth)
-    vis_dmd3c = visualize_depth_fast(dmd3c_depth)
-    vis_penet = visualize_depth_fast(penet_depth)
+    vis_dmd3c = visualize_depth_fast(dmd3c_depth, min_valid=0.0)
+    vis_penet = visualize_depth_fast(penet_depth, min_valid=0.0)
 
     # Original RGB image (resize to match depth map dimensions if needed)
     rgb_vis = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_RGB2BGR)  # BGR for OpenCV display
@@ -433,10 +444,10 @@ def compare_single_frame(frame_id: str, save_dir: Path | None = None):
     if rgb_vis.shape[:2] != (H, W):
         rgb_vis = cv2.resize(rgb_vis, (W, H))
 
-    # Create side-by-side comparison: Original | Sparse Depth | DMD3C Predicted | PENet Predicted
-    panel_labels = ["Original RGB", "Sparse LiDAR", "DMD3C Pred.", "PENet Pred."]
+    # Create side-by-side comparison: Original | DMD3C Predicted | PENet Predicted
+    panel_labels = ["Original RGB", "DMD3C Pred.", "PENet Pred."]
     
-    panels = [rgb_vis, vis_sparse, vis_dmd3c, vis_penet]
+    panels = [rgb_vis, vis_dmd3c, vis_penet]
     
     # Add text labels to each panel top-left corner
     labeled_panels = []
@@ -449,8 +460,7 @@ def compare_single_frame(frame_id: str, save_dir: Path | None = None):
     # Concatenate horizontally with separators
     separator = np.zeros((H, 10, 3), dtype=np.uint8) + 64  # gray vertical bars
     
-    comparison = np.hstack([panels[0], separator] + 
-                          [sep for p in panels[1:] for sep in [separator, p]])
+    comparison = np.hstack([panels[0], separator, panels[1], separator, panels[2]])
 
     print(f"  Comparison image shape: {comparison.shape}")
     
