@@ -42,20 +42,39 @@ def Dist(Pc, IPCnum, args, H, W):
         flat_yy = yy_grid.flatten()   # (HW,)
         flat_xx = xx_grid.flatten()   # (HW,)
 
-        # For every grid cell find the nearest point index
-        # Shape: (N_valid, HW) — distance from each point to each grid cell
-        dx = px.view(-1, 1).float() - flat_xx.float().view(1, -1)
-        dy = py.view(-1, 1).float() - flat_yy.float().view(1, -1)
-        dist_sq = dx * dx + dy * dy   # (N_valid, HW)
-
-        if N_valid == 0 or dist_sq.numel() == 0:
+        if N_valid == 0:
             hw_total = H * W
-            num_rows = args[b].shape[0]  # get num from the shape of args row
-            nearest_idx = torch.zeros(hw_total, dtype=torch.long, device=px.device).repeat(num_rows)  # repeat for each row
+            num_rows = args[b].shape[0]  
+            nearest_idx = torch.zeros(num_rows, hw_total, dtype=torch.long, device=px.device)
         else:
-            nearest_idx = torch.argmin(dist_sq, dim=0)  # (HW,) long
+            # To avoid massive memory allocation (N_valid * HW), we process in chunks of points
+            min_dist_sq = torch.full((H * W,), float('inf'), device=px.device)
+            nearest_idx = torch.zeros(H * W, dtype=torch.long, device=px.device)
 
-        args[b] = nearest_idx.view(args[b].shape)
+            points_2d = torch.stack([px, py], dim=1)  # (N_valid, 2)
+            grid_2d = torch.stack([flat_xx, flat_yy], dim=1).float()  # (HW, 2)
+
+            chunk_size = 500  # Process 500 points at a time to keep memory usage low (~800MB per chunk)
+            for i in range(0, N_valid, chunk_size):
+                end_i = min(i + chunk_size, N_valid)
+                points_chunk = points_2d[i:end_i]  # (C, 2)
+
+                # dists shape (C, HW)
+                dists = torch.cdist(points_chunk, grid_2d)
+
+                # Find min distance in this chunk for each pixel
+                current_min_dist, current_min_idx_in_chunk = torch.min(dists, dim=0)  # (HW,)
+
+                # Update global minimums where the new chunk has a closer point
+                mask = current_min_dist < min_dist_sq
+                min_dist_sq[mask] = current_min_dist[mask]
+                nearest_idx[mask] = i + current_min_idx_in_chunk[mask]
+            
+            # Reshape to match args[b] which is expected to be (num, HW)
+            if nearest_idx.dim() == 1:
+                nearest_idx = nearest_idx.view(-1, H * W)
+
+        args[b] = nearest_idx
 
     return IPCnum, args
 

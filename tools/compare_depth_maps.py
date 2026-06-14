@@ -129,6 +129,11 @@ def project_lidar_to_depth(lidar_points: np.ndarray, K: np.ndarray, RT: np.ndarr
     homo_points = np.hstack([lidar_points, np.ones((N, 1))])  # Nx4
     cam_points = (RT @ homo_points.T).T  # Nx3 in camera coordinates
 
+    # DEBUG: Check first few cam_points
+    if N > 0:
+        print(f"  [DEBUG] First 5 cam_points:\n{cam_points[:5]}")
+        print(f"  [DEBUG] Cam points mean Z: {np.mean(cam_points[:, 2]):.2f}, min Z: {np.min(cam_points[:, 2]):.2f}, max Z: {np.max(cam_points[:, 2]):.2f}")
+
     x_img = cam_points[:, 0] / (cam_points[:, 2] + 1e-8) * K[0, 0] + K[0, 2]
     y_img = cam_points[:, 1] / (cam_points[:, 2] + 1e-8) * K[1, 1] + K[1, 2]
 
@@ -136,14 +141,15 @@ def project_lidar_to_depth(lidar_points: np.ndarray, K: np.ndarray, RT: np.ndarr
     iy = np.floor(y_img).astype(int)
 
     valid = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H) & (cam_points[:, 2] > 0.5)
+    print(f"  [DEBUG] Projection valid count: {valid.sum()} / {N}")
 
     ix, iy = ix[valid], iy[valid]
     depths = cam_points[valid, 2]
 
-    # Keep the closest point at each pixel using np.maximum for efficiency
+    # Keep the closest point at each pixel using np.isnan for correct NaN check
     for i in range(len(ix)):
         d = depths[i]
-        if depth_map[iy[i], ix[i]] == np.nan or d < depth_map[iy[i], ix[i]]:
+        if np.isnan(depth_map[iy[i], ix[i]]) or d < depth_map[iy[i], ix[i]]:
             depth_map[iy[i], ix[i]] = d
 
     return depth_map
@@ -218,39 +224,55 @@ def load_velodyne(velo_path: Path):
 # Depth visualization (shared, consistent for both models)
 # ---------------------------------------------------------------------------
 
-DEPTH_MIN = 0.5   # minimum valid distance in meters
+DEPTH_MIN = 0.5   # minimum valid distance in meters (for sparse LiDAR only)
 DEPTH_MAX = 70.0  # maximum clipping range — matches DMD3C default
 
-def visualize_depth_fast(depth: np.ndarray, min_valid: float = DEPTH_MIN) -> np.ndarray:
-    """Faster vectorized depth visualization using OpenCV COLORMAP_JET.
+def visualize_depth(depth: np.ndarray, grayscale: bool = False, min_valid: float = DEPTH_MIN) -> np.ndarray:
+    """Visualize depth map using OpenCV COLORMAP_JET or Grayscale with FIXED scale [min_valid, DEPTH_MAX].
 
-    Invalid regions (outside [min_valid, DEPTH_MAX] or NaN) are left BLACK (0,0,0).
-    Valid regions use normalized colormap with local min/max scaling for best contrast.
+    If grayscale=False (default):
+        Blue  = close objects (~0.5m), Red/yellow = far objects (70m+).
+    If grayscale=True:
+        White = close objects (~0.5m), Black = far objects (70m+) or invalid.
+
+    Invalid/NaN regions stay BLACK for clear contrast.
     """
     H, W = depth.shape
-    
-    # Create a float32 version for colormap input (values 0-255 expected by applyColorMap)
-    normed = np.zeros((H, W), dtype=np.float32)
-    
     mask = (depth >= min_valid) & (depth <= DEPTH_MAX) & ~np.isnan(depth)
-    clipped_depth = np.clip(depth, min_valid, DEPTH_MAX).copy()
     
-    if mask.sum() > 1:
-        d_min_local = clipped_depth[mask].min()
-        d_max_local = clipped_depth[mask].max()
-        if d_max_local - d_min_local > 0:
-            normed[mask] = ((clipped_depth[mask] - d_min_local) / (d_max_local - d_min_local)) * 255.0
-    
-    # Convert to uint8 for applyColorMap
-    normed_uint8 = np.uint8(np.clip(normed, 0, 255))
-    
-    # Apply colormap row by row (vectorized per-row)
-    vis_colored = np.zeros((H, W, 3), dtype=np.uint8)  # Invalid regions stay BLACK
-    for h in range(H):
-        if mask[h].any():
-            vis_colored[h] = cv2.applyColorMap(normed_uint8[h:h+1], cv2.COLORMAP_JET)[0]
-    
-    return vis_colored
+    if not mask.any():
+        return np.zeros((H, W, 3), dtype=np.uint8)
+
+    if grayscale:
+        vis_gray = np.zeros((H, W), dtype=np.uint8)  # Invalid regions stay BLACK
+        clipped_depth = np.clip(depth[mask], min_valid, DEPTH_MAX).astype(np.float32)
+        
+        # Closer is whiter (255), farther is blacker (0)
+        normed_values = (1.0 - (clipped_depth - min_valid) / (DEPTH_MAX - min_valid)) * 255.0
+        vis_gray[mask] = normed_values.astype(np.uint8)
+        return cv2.cvtColor(vis_gray, cv2.COLOR_GRAY2BGR)
+    else:
+        # COLORMAP_JET mode
+        vis_colored = np.zeros((H, W, 3), dtype=np.uint8)  # Invalid regions stay BLACK
+        clipped_depth = np.clip(depth[mask], min_valid, DEPTH_MAX).astype(np.float32)
+        
+        # Fixed-scale normalization: map [min_valid, DEPTH_MAX] linearly to [0, 255]
+        normed_values = ((clipped_depth - min_valid) / (DEPTH_MAX - min_valid)) * 255.0
+        
+        mask_flat = mask.flatten()
+        vis_colored_flat = np.zeros((H * W, 3), dtype=np.uint8)
+        
+        # Reshape for applyColorMap which expects (1, N, 3) or (N, 1) uint8 array
+        normed_uint8 = np.clip(normed_values, 0, 255).astype(np.float32).reshape(-1, 1)
+        colored_flat = cv2.applyColorMap(normed_uint8.astype(np.uint8), cv2.COLORMAP_JET)
+        
+        vis_colored_flat[mask_flat] = colored_flat
+        return vis_colored_flat.reshape(H, W, 3)
+
+
+# Legacy function kept for backward compatibility — uses simple projection without RT transform
+def project_lidar_to_depth_simple(lidar_points: np.ndarray, K: np.ndarray):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +312,16 @@ def run_dmd3c(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
     
     # The last element (pred0) is the full-resolution prediction
     pred_depth = output_list[-1] if isinstance(output_list, list) else output_list
-    return pred_depth.squeeze().cpu().numpy()
+    
+    depth_np = pred_depth.squeeze().cpu().numpy()
+    
+    return depth_np.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
 # PENet model loader & inference (adapted from main.py + vis_utils.py)
 # ---------------------------------------------------------------------------
+
 
 def run_penet(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
     """Run PENet model and return predicted depth map."""
@@ -373,13 +399,20 @@ def run_penet(image: np.ndarray, sparse_depth: np.ndarray, K: np.ndarray):
     
     if isinstance(pred, (list, tuple)):
         pred_depth = pred[-1]  # last element is final depth prediction
+    else:
+        pred_depth = pred
     
-    return pred_depth.squeeze().cpu().numpy()
+    depth_np = pred_depth.squeeze().cpu().numpy()
+    
+    return depth_np.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
 # Main comparison pipeline
 # ---------------------------------------------------------------------------
+
+
+
 
 def compare_single_frame(frame_id: str, save_dir: Path | None = None):
     """Run both models on a single KITTI frame and produce comparison visualization."""
@@ -405,13 +438,22 @@ def compare_single_frame(frame_id: str, save_dir: Path | None = None):
     image = load_image(image_path)  # HxWxC, float32
     
     lidar_points = load_velodyne(velo_path)
+    print(f"  [DEBUG] LiDAR points min/max: {lidar_points.min():.2f}/{lidar_points.max():.2f}")
     
     K = load_calibration(calib_path)
     RT = load_velo2cam_transform(calib_path)
+    print(f"  [DEBUG] K: {K.flatten()}, RT: {RT.flatten()}")
     
     sparse_depth = project_lidar_to_depth(lidar_points, K, RT)
 
     print(f"  LiDAR points: {len(lidar_points)}, Valid depth pixels: {(sparse_depth > DEPTH_MIN).sum()}")
+    if (sparse_depth > DEPTH_MIN).sum() == 0:
+        print("  [WARNING] No valid sparse depth pixels found! Check projection and calibration.")
+        # Try simple projection as fallback for debugging
+        print("  [DEBUG] Trying simple projection...")
+        sparse_depth = project_lidar_to_depth_simple(lidar_points, K)
+        valid_count = (sparse_depth > DEPTH_MIN).sum() if sparse_depth is not None else 0
+        print(f"  [DEBUG] Simple projection valid pixels: {valid_count}")
 
     # Run DMD3C
     print("  Running DMD3C...")
@@ -430,10 +472,12 @@ def compare_single_frame(frame_id: str, save_dir: Path | None = None):
         valid_count_p = ((penet_depth >= DEPTH_MIN) & (penet_depth <= DEPTH_MAX)).sum()
         print(f"  PENET output shape={penet_depth.shape}, min={penet_depth.min():.2f}, max={penet_depth.max():.2f}, valid pixels={valid_count_p}")
 
-    # Visualize all depth maps consistently (OpenCV COLORMAP_JET, [0.5, 70]m clip)
-    vis_sparse = visualize_depth_fast(sparse_depth)
-    vis_dmd3c = visualize_depth_fast(dmd3c_depth, min_valid=0.0)
-    vis_penet = visualize_depth_fast(penet_depth, min_valid=0.0)
+    # Visualize all depth maps consistently (OpenCV COLORMAP_JET or Grayscale)
+    # All use FIXED scale [DEPTH_MIN, DEPTH_MAX] for consistent color mapping:
+    #   Grayscale mode: White = close objects (~0.5m), Black = far objects (70m+)
+    vis_sparse = visualize_depth(sparse_depth, grayscale=True)
+    vis_dmd3c = visualize_depth(dmd3c_depth, grayscale=True)
+    vis_penet = visualize_depth(penet_depth, grayscale=True)
 
     # Original RGB image (resize to match depth map dimensions if needed)
     rgb_vis = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_RGB2BGR)  # BGR for OpenCV display
